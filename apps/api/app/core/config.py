@@ -20,11 +20,22 @@ class Settings(BaseSettings):
 
     admin_emails: str = Field(default="", alias="ADMIN_EMAILS")
 
+    # CORS: 콤마 구분 허용 origin 목록
+    # 예) ALLOWED_ORIGINS=https://meetin.kr,https://www.meetin.kr
+    allowed_origins: str = Field(
+        default="http://localhost:3000,http://127.0.0.1:3000",
+        alias="ALLOWED_ORIGINS",
+    )
+
     def admin_email_set(self) -> set[str]:
         raw = (self.admin_emails or "").strip()
         if not raw:
             return set()
         return {e.strip().lower() for e in raw.split(",") if e.strip()}
+
+    def allowed_origins_list(self) -> list[str]:
+        """환경변수 하나로 여러 origin 관리 — 배포 시 프론트 도메인만 추가하면 됨"""
+        return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
 
 
 settings = Settings()

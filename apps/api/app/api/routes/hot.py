@@ -8,13 +8,13 @@ from app.models.meeting import Team  # Team.MALE/FEMALE 재사용
 
 router = APIRouter()
 
-def _user_team_from_gender(user) -> Team:
+def _user_team_from_gender(user) -> Team | None:
     if not getattr(user, "gender", None):
-        # HOT는 프로필 성별 없으면 계산 불가
         return None
     if getattr(user.gender, "name", None) == "MALE" or user.gender == Team.MALE:
         return Team.MALE
     return Team.FEMALE
+
 
 def _opposite_team(team: Team) -> Team:
     return Team.FEMALE if team == Team.MALE else Team.MALE
@@ -34,7 +34,11 @@ def hot_universities(
     """
     my_team = _user_team_from_gender(user)
 
+    # ✅ gender=opposite인데 내 성별이 없으면 400 반환 (None.value 500 방지)
     if gender == "opposite":
+        if my_team is None:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail="Profile gender required for opposite filter")
         target_team = _opposite_team(my_team)
     elif gender == "male":
         target_team = Team.MALE

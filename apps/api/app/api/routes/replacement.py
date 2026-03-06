@@ -185,8 +185,11 @@ def respond_replacement(
             db.commit()
             return {"status": "leaver_not_member_anymore"}
 
-        # replace
+        # replace: 새 멤버(candidate)로 교체
+        # ✅ confirmed 반드시 False로 리셋 — 이전 leaver의 confirmed=True를 물려받으면 안 됨
+        # 이 사람이 아직 참가 의사를 표현하지 않았기 때문
         leaver_slot.user_id = user.id
+        leaver_slot.confirmed = False
         req.status = ReplacementStatus.ACCEPTED
         db.add(req)
 
