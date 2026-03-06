@@ -11,6 +11,12 @@ class Settings(BaseSettings):
 
     database_url: str = Field(alias="DATABASE_URL")
 
+    # ─── DB Connection Pool ───────────────────────────────────────
+    db_pool_size:    int = Field(default=10,   alias="DB_POOL_SIZE")
+    db_max_overflow: int = Field(default=20,   alias="DB_MAX_OVERFLOW")
+    db_pool_timeout: int = Field(default=30,   alias="DB_POOL_TIMEOUT")
+    db_pool_recycle: int = Field(default=1800, alias="DB_POOL_RECYCLE")
+
     jwt_secret: str = Field(alias="JWT_SECRET")
     jwt_alg: str = Field(default="HS256", alias="JWT_ALG")
     access_token_expire_minutes: int = Field(default=60, alias="ACCESS_TOKEN_EXPIRE_MINUTES")

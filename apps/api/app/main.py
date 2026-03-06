@@ -1,6 +1,10 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.config import settings
 from app.api.router import router
@@ -58,11 +62,41 @@ class JsonFormatter(logging.Formatter):
 for handler in logging.root.handlers:
     handler.setFormatter(JsonFormatter())
 
+
+# ─── APScheduler 환불 배치 Lifespan ──────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    앱 시작/종료 시 스케줄러를 시작/중단.
+
+    - 시작: REFUND_PENDING 배치 잡 (5분 주기)
+    - 종료: 스케줄러 graceful shutdown
+    """
+    try:
+        from app.services.scheduler import start_scheduler
+        start_scheduler()
+        logger.info("[APP] Scheduler started (refund batch every 5 min)")
+    except ImportError:
+        logger.warning("[APP] APScheduler not installed — refund batch disabled. Run: pip install apscheduler")
+    except Exception as e:
+        logger.error("[APP] Failed to start scheduler: %s", e, exc_info=True)
+
+    yield  # 앱 실행
+
+    try:
+        from app.services.scheduler import stop_scheduler
+        stop_scheduler()
+        logger.info("[APP] Scheduler stopped")
+    except Exception:
+        pass
+
+
 # ─── FastAPI 앱 ────────────────────────────────────────────────────
 app = FastAPI(
     title=settings.app_name,
     docs_url="/docs" if settings.debug else None,
     redoc_url="/redoc" if settings.debug else None,
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -87,6 +121,62 @@ try:
     logger.info("Rate limiting enabled (slowapi)")
 except ImportError:
     logger.warning("slowapi not installed — rate limiting disabled. Run: pip install slowapi")
+
+
+# ─── 글로벌 에러 핸들러 ───────────────────────────────────────────
+
+def _error_response(status_code: int, detail: str | list, request_id: str | None = None) -> JSONResponse:
+    """통일된 에러 응답 포맷 반환.
+
+    {
+        "error": {
+            "status": 422,
+            "detail": "...",
+            "request_id": "abc12345"   ← 디버깅용
+        }
+    }
+    """
+    body = {
+        "error": {
+            "status": status_code,
+            "detail": detail,
+        }
+    }
+    if request_id:
+        body["error"]["request_id"] = request_id
+    return JSONResponse(status_code=status_code, content=body)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """FastAPI/Starlette HTTPException → 통일된 포맷으로 변환"""
+    request_id = getattr(request.state, "request_id", None)
+    return _error_response(exc.status_code, exc.detail, request_id)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Pydantic 유효성 검사 실패 → 읽기 쉬운 메시지로 변환 (422)"""
+    request_id = getattr(request.state, "request_id", None)
+    errors = []
+    for err in exc.errors():
+        loc = " → ".join(str(v) for v in err["loc"] if v != "body")
+        errors.append(f"{loc}: {err['msg']}" if loc else err["msg"])
+    detail = errors if len(errors) > 1 else (errors[0] if errors else "Validation error")
+    return _error_response(422, detail, request_id)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """처리되지 않은 예외 → 500 (스택트레이스는 로그에만)"""
+    request_id = getattr(request.state, "request_id", None)
+    logger.error(
+        "Unhandled exception: %s",
+        exc,
+        exc_info=True,
+        extra={"request_id": request_id} if request_id else {},
+    )
+    return _error_response(500, "서버 내부 오류가 발생했습니다. 잠시 후 다시 시도해주세요.", request_id)
 
 
 # ─── Request ID + 구조화 로깅 미들웨어 ───────────────────────────
@@ -126,4 +216,12 @@ app.include_router(router)
 
 @app.get("/health")
 def health():
-    return {"ok": True, "env": settings.env}
+    """헬스체크 엔드포인트 — DB 연결 상태 포함"""
+    from app.db.session import db_ping
+    db_ok = db_ping()
+    return {
+        "ok": db_ok,
+        "env": settings.env,
+        "db": "ok" if db_ok else "error",
+        "version": "3.0.0",
+    }

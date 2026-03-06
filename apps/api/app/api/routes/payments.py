@@ -25,7 +25,7 @@ import httpx
 import base64
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -40,6 +40,23 @@ from app.models.user import User
 from app.services.notification import notify
 
 router = APIRouter()
+
+# slowapi rate limiter (설치된 경우 적용, 없으면 noop 데코레이터 사용)
+try:
+    from slowapi import Limiter
+    from slowapi.util import get_remote_address
+    _limiter = Limiter(key_func=get_remote_address)
+    def _rate_limit(limit: str):
+        return _limiter.limit(limit)
+except ImportError:
+    import functools
+    def _rate_limit(limit: str):  # type: ignore[misc]
+        def decorator(func):
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                return func(*args, **kwargs)
+            return wrapper
+        return decorator
 
 DEPOSIT_AMOUNT = 10_000  # 10,000원 (정책: 10,000~20,000 KRW)
 
@@ -79,7 +96,6 @@ async def _toss_refund(payment_key: str, cancel_reason: str, amount: int) -> dic
     """
     toss_secret = getattr(settings, "toss_secret_key", None)
     if not toss_secret:
-        # 개발/테스트 환경: mock 성공 반환
         return {"ok": True, "mock": True}
 
     credentials = base64.b64encode(f"{toss_secret}:".encode()).decode()
@@ -100,12 +116,66 @@ async def _toss_refund(payment_key: str, cancel_reason: str, amount: int) -> dic
         return {"ok": False, "error": str(e)}
 
 
+def _toss_confirm_sync(order_id: str, payment_key: str, amount: int) -> dict:
+    """
+    Toss 결제 승인 API 동기 호출 (confirm_payment 는 동기 함수이므로).
+
+    Toss 승인 API:
+      POST https://api.tosspayments.com/v1/payments/confirm
+      Authorization: Basic base64(secretKey:)
+      Body: { orderId, paymentKey, amount }
+
+    성공 응답: HTTP 200, { paymentKey, orderId, status: "DONE", ... }
+    실패 응답: HTTP 4xx, { code, message }
+
+    반환:
+      { ok: True, ... }  — 성공
+      { ok: False, message: "..." }  — 실패
+    """
+    toss_secret = settings.toss_secret_key
+    if not toss_secret:
+        # 개발환경: mock 성공
+        return {"ok": True, "mock": True}
+
+    credentials = base64.b64encode(f"{toss_secret}:".encode()).decode()
+
+    try:
+        resp = httpx.post(
+            "https://api.tosspayments.com/v1/payments/confirm",
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "orderId":    order_id,
+                "paymentKey": payment_key,
+                "amount":     amount,
+            },
+            timeout=10.0,
+        )
+        data = resp.json()
+        if resp.status_code == 200:
+            return {"ok": True, **data}
+        # Toss 에러 응답: { "code": "...", "message": "..." }
+        return {
+            "ok":      False,
+            "code":    data.get("code", "UNKNOWN"),
+            "message": data.get("message", f"Toss HTTP {resp.status_code}"),
+        }
+    except httpx.TimeoutException:
+        return {"ok": False, "message": "Toss API 타임아웃 (10s)"}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+
 # ─────────────────────────────────────────────────────────────────
 # 1) Deposit Prepare
 # ─────────────────────────────────────────────────────────────────
 
 @router.post("/payments/deposits/prepare")
+@_rate_limit("20/minute")  # 주문 생성: IP당 분당 20회 제한
 def prepare_deposit(
+    request: Request,
     meeting_id: int,
     db: Session = Depends(get_db),
     user=Depends(require_verified),
@@ -183,7 +253,9 @@ def prepare_deposit(
 # ─────────────────────────────────────────────────────────────────
 
 @router.post("/payments/toss/confirm")
+@_rate_limit("20/minute")  # 결제 승인: IP당 분당 20회 제한 (중복 확인 방지)
 def confirm_payment(
+    request: Request,
     order_id: str,
     background_tasks: BackgroundTasks,
     payment_key: str | None = None,
@@ -248,18 +320,22 @@ def confirm_payment(
         # ── 4. 멤버 재확인 (leave 했을 수도 있음) ───────────────
         slot = _ensure_user_is_meeting_member(db, meeting.id, user.id)
 
-        # ── TODO: 실제 Toss 서버 검증 API 호출 ──────────────────
-        # toss_secret = settings.toss_secret_key
-        # credentials = base64.b64encode(f"{toss_secret}:".encode()).decode()
-        # resp = httpx.post(
-        #     "https://api.tosspayments.com/v1/payments/confirm",
-        #     headers={"Authorization": f"Basic {credentials}", "Content-Type": "application/json"},
-        #     json={"orderId": order_id, "paymentKey": payment_key, "amount": deposit.amount},
-        # )
-        # if resp.status_code != 200:
-        #     raise HTTPException(400, resp.json().get("message", "Toss 결제 승인 실패"))
+        # ── 5-a. 실제 Toss 서버 검증 API 호출 ───────────────────
+        # TOSS_SECRET_KEY 가 설정된 경우 실결제 검증, 없으면 mock 처리.
+        # 참고: https://docs.tosspayments.com/reference#%EA%B2%B0%EC%A0%9C-%EC%8A%B9%EC%9D%B8
+        if settings.toss_secret_key and payment_key:
+            toss_result = _toss_confirm_sync(
+                order_id=order_id,
+                payment_key=payment_key,
+                amount=deposit.amount,
+            )
+            if not toss_result.get("ok"):
+                raise HTTPException(
+                    400,
+                    toss_result.get("message") or "Toss 결제 승인 실패",
+                )
 
-        # ── 5. 확정 처리 (단일 소스: slot.confirmed) ────────────
+        # ── 5-b. 확정 처리 (단일 소스: slot.confirmed) ──────────
         if payment_key:
             deposit.toss_payment_key = payment_key
         deposit.status = DepositStatus.HELD

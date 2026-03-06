@@ -38,6 +38,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         password_hash=hash_password(payload.password),
         phone_hash=phash,
         phone_last4=phone_last4(e164),
+        phone_e164=e164,           # 알림 발송용 원문 번호 저장
         phone_verified=False,
         is_admin=(email in settings.admin_email_set()),
     )

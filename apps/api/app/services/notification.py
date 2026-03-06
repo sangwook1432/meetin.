@@ -89,13 +89,10 @@ async def _send_alimtalk(
 
 def _get_phone(user: "User") -> str | None:
     """
-    User 모델에서 알림 발송용 전화번호 추출.
-    phone_hash 는 HMAC 이므로 원문 복원 불가 → phone_last4 만 있음.
-    실제 SMS 발송에는 원문 번호가 필요하므로 User 테이블에 phone_e164 컬럼 추가가 권장됨.
-    현재는 phone_last4 로 mock 처리.
+    User 모델에서 알림 발송용 전화번호 추출 (E.164 형식).
+    phone_e164 가 없는 레거시 계정은 None 반환 → 알림 스킵.
     """
-    # TODO: User.phone_e164 컬럼 추가 후 return user.phone_e164
-    return getattr(user, "phone_e164", None) or f"010****{getattr(user, 'phone_last4', '0000')}"
+    return getattr(user, "phone_e164", None)
 
 
 # ─────────────────────────────────────────────────────────────────

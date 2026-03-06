@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import select, delete
 from collections import defaultdict
@@ -13,6 +13,24 @@ from app.models.deposit import Deposit, DepositStatus
 from app.models.chat_room import ChatRoom
 
 router = APIRouter()
+
+# slowapi rate limiter (설치된 경우 적용, 없으면 noop 데코레이터 사용)
+try:
+    from slowapi import Limiter
+    from slowapi.util import get_remote_address
+    _limiter = Limiter(key_func=get_remote_address)
+    def _rate_limit(limit: str):
+        return _limiter.limit(limit)
+except ImportError:
+    import functools
+    def _rate_limit(limit: str):  # type: ignore[misc]
+        """slowapi 미설치 시 noop 데코레이터"""
+        def decorator(func):
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                return func(*args, **kwargs)
+            return wrapper
+        return decorator
 
 
 # -------------------------
@@ -121,7 +139,9 @@ def create_meeting(
 # Join Meeting
 # -------------------------
 @router.post("/meetings/{meeting_id}/join")
+@_rate_limit("30/minute")  # 참가 요청: IP당 분당 30회 제한 (동시 다중 join 방지)
 def join_meeting(
+    request: Request,
     meeting_id: int,
     db: Session = Depends(get_db),
     user=Depends(require_verified),

@@ -103,7 +103,9 @@ async function apiFetch<T>(
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body?.detail ?? `HTTP ${res.status}`);
+    // 통일된 에러 포맷: { error: { detail: "..." } } 또는 레거시 { detail: "..." }
+    const detail = body?.error?.detail ?? body?.detail ?? `HTTP ${res.status}`;
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
   }
 
   const text = await res.text();
@@ -255,4 +257,49 @@ export async function sendMessage(roomId: number, content: string) {
     method: "POST",
     body: JSON.stringify({ content }),
   });
+}
+
+// ─────────────────────────────────────────
+// Payments (Toss)
+// ─────────────────────────────────────────
+
+/** POST /payments/deposits/prepare — Toss 위젯 결제 전 주문 생성 */
+export async function prepareDeposit(meetingId: number): Promise<{
+  orderId: string;
+  amount: number;
+  orderName: string;
+}> {
+  return apiFetch(`/payments/deposits/prepare?meeting_id=${meetingId}`, {
+    method: "POST",
+  });
+}
+
+/** POST /payments/toss/confirm — Toss 결제 성공 콜백 후 서버 검증 */
+export async function confirmTossPayment(params: {
+  order_id: string;
+  payment_key?: string;
+}): Promise<{
+  status: "confirmed" | "already_confirmed";
+  meeting_id: number;
+  meeting_status: string;
+  chat_room_id: number | null;
+}> {
+  const qs = new URLSearchParams({ order_id: params.order_id });
+  if (params.payment_key) qs.set("payment_key", params.payment_key);
+  return apiFetch(`/payments/toss/confirm?${qs}`, { method: "POST" });
+}
+
+/** GET /payments/deposits/me — 내 보증금 목록 */
+export async function getMyDeposits(meetingId?: number): Promise<{
+  deposits: {
+    id: number;
+    meeting_id: number;
+    amount: number;
+    status: string;
+    toss_order_id: string;
+    created_at: string;
+  }[];
+}> {
+  const qs = meetingId !== undefined ? `?meeting_id=${meetingId}` : "";
+  return apiFetch(`/payments/deposits/me${qs}`);
 }

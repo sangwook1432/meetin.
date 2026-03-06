@@ -7,18 +7,28 @@
  * 1. 팀별 슬롯 + confirmed/대기중 뱃지 (TeamSection → SlotCard)
  * 2. 상태별 액션 버튼
  *    - RECRUITING : [참가하기] / [참가중] / [나가기]
- *    - WAITING_CONFIRM : [확정하기] (내가 아직 안 했을 때) / [확정 완료]
+ *    - WAITING_CONFIRM : [보증금 결제 + 확정] / [확정 완료]
  *    - CONFIRMED : [채팅방 입장]
  * 3. CONFIRMED 전환 직후 → 자동으로 /chats/[roomId]로 이동
+ *
+ * Toss 결제 흐름:
+ *   ① prepare_deposit → orderId / amount / orderName 획득
+ *   ② loadTossPayments(clientKey).requestPayment(...)  [Toss JS SDK]
+ *   ③ 성공 콜백 URL: /payments/success?orderId=...&paymentKey=...&amount=...
+ *      → confirmTossPayment(order_id, payment_key)  [서버 검증]
+ *   ※ 개발 환경(clientKey 없음): mock 결제 경로로 직접 서버 confirm 호출
  */
 
-import { useEffect, useRef, useState } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import {
   getMeeting,
   joinMeeting,
   leaveMeeting,
   confirmMeeting,
+  prepareDeposit,
+  confirmTossPayment,
+  getMyDeposits,
 } from "@/lib/api";
 import type { MeetingDetail, MeetingStatus } from "@/types";
 import { TeamSection } from "@/components/meeting/TeamSection";
@@ -37,20 +47,25 @@ const MEETING_TYPE_LABEL: Record<string, string> = {
   THREE_BY_THREE: "3 : 3",
 };
 
+const TOSS_CLIENT_KEY = process.env.NEXT_PUBLIC_TOSS_CLIENT_KEY ?? "";
+
 export default function MeetingDetailPage() {
   const params = useParams();
+  const searchParams = useSearchParams();
   const router = useRouter();
   const meetingId = Number(params.id);
 
   const [meeting, setMeeting] = useState<MeetingDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(false);
+  const [paymentLoading, setPaymentLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [paymentStatus, setPaymentStatus] = useState<string | null>(null);
 
   // 폴링: WAITING_CONFIRM 상태에서 다른 유저의 confirm을 실시간 반영
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const fetchMeeting = async () => {
+  const fetchMeeting = useCallback(async () => {
     try {
       const data = await getMeeting(meetingId);
       setMeeting(data);
@@ -60,12 +75,50 @@ export default function MeetingDetailPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [meetingId]);
 
   useEffect(() => {
     fetchMeeting();
+  }, [fetchMeeting]);
+
+  // ─── Toss 결제 성공 콜백 처리 ────────────────────────────
+  // URL: /meetings/[id]?orderId=...&paymentKey=...&amount=... (Toss 리다이렉트)
+  useEffect(() => {
+    const orderId = searchParams.get("orderId");
+    const paymentKey = searchParams.get("paymentKey");
+    const paymentAmount = searchParams.get("amount");
+
+    if (!orderId) return;
+
+    // Toss 결제 성공 콜백 → 서버 검증
+    (async () => {
+      setPaymentLoading(true);
+      setPaymentStatus("결제 검증 중...");
+      try {
+        const result = await confirmTossPayment({
+          order_id: orderId,
+          payment_key: paymentKey ?? undefined,
+        });
+        setPaymentStatus("✅ 결제 완료! 확정 처리 중...");
+
+        if (result.meeting_status === "CONFIRMED" && result.chat_room_id) {
+          router.push(`/chats/${result.chat_room_id}`);
+          return;
+        }
+        await fetchMeeting();
+        setPaymentStatus("✅ 보증금 결제 완료. 다른 멤버를 기다리는 중...");
+
+        // URL 파라미터 정리 (히스토리 교체)
+        router.replace(`/meetings/${meetingId}`);
+      } catch (e) {
+        setPaymentStatus(null);
+        alert(e instanceof Error ? e.message : "결제 검증 실패");
+      } finally {
+        setPaymentLoading(false);
+      }
+    })();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meetingId]);
+  }, []);
 
   // WAITING_CONFIRM 상태일 때 5초마다 폴링
   useEffect(() => {
@@ -80,8 +133,7 @@ export default function MeetingDetailPage() {
     return () => {
       if (pollingRef.current) clearInterval(pollingRef.current);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meeting?.status]);
+  }, [meeting?.status, fetchMeeting]);
 
   // ─── 액션 핸들러 ──────────────────────────────────────────
 
@@ -111,6 +163,64 @@ export default function MeetingDetailPage() {
       alert(e instanceof Error ? e.message : "나가기 실패");
     } finally {
       setActionLoading(false);
+    }
+  };
+
+  /**
+   * Toss 결제 위젯 실행
+   * - TOSS_CLIENT_KEY가 있으면 실결제 위젯 실행
+   * - 없으면 개발용 mock: 바로 서버 confirm 호출
+   */
+  const handlePayment = async () => {
+    setPaymentLoading(true);
+    try {
+      // 1. 서버에서 주문 정보 획득
+      const order = await prepareDeposit(meetingId);
+
+      if (!TOSS_CLIENT_KEY) {
+        // ── 개발/테스트 환경: mock 결제 (Toss 위젯 없이 서버 직접 confirm) ──
+        setPaymentStatus("개발 환경: mock 결제 진행 중...");
+        const result = await confirmTossPayment({ order_id: order.orderId });
+        setPaymentStatus("✅ Mock 결제 완료!");
+
+        if (result.meeting_status === "CONFIRMED" && result.chat_room_id) {
+          router.push(`/chats/${result.chat_room_id}`);
+          return;
+        }
+        await fetchMeeting();
+        return;
+      }
+
+      // ── 실제 환경: Toss 결제 위젯 SDK 실행 ──
+      // @ts-expect-error — 글로벌 window.TossPayments (CDN 로드)
+      const tossPayments = window.TossPayments?.(TOSS_CLIENT_KEY);
+      if (!tossPayments) {
+        alert("Toss 결제 모듈을 불러오는 중입니다. 잠시 후 다시 시도해주세요.");
+        return;
+      }
+
+      const successUrl = `${window.location.origin}/meetings/${meetingId}`;
+      const failUrl = `${window.location.origin}/meetings/${meetingId}?paymentFail=1`;
+
+      await tossPayments.requestPayment("카드", {
+        amount: order.amount,
+        orderId: order.orderId,
+        orderName: order.orderName,
+        customerName: "MEETIN 참가자",
+        successUrl,
+        failUrl,
+      });
+      // 성공 시 Toss가 successUrl로 리다이렉트 → useEffect에서 자동 처리
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "결제 실패";
+      // 사용자가 결제 취소한 경우 에러 무시
+      if (msg.includes("취소") || msg.includes("cancel")) {
+        setPaymentStatus(null);
+      } else {
+        alert(msg);
+      }
+    } finally {
+      setPaymentLoading(false);
     }
   };
 
@@ -173,6 +283,12 @@ export default function MeetingDetailPage() {
 
   return (
     <div className="min-h-screen bg-gray-50">
+      {/* Toss SDK CDN 로드 (실결제 환경만) */}
+      {TOSS_CLIENT_KEY && (
+        // eslint-disable-next-line @next/next/no-sync-scripts
+        <script src="https://js.tosspayments.com/v1/payment" />
+      )}
+
       <div className="mx-auto max-w-md">
         {/* 헤더 */}
         <div className="sticky top-0 z-10 flex items-center gap-3 border-b border-gray-100 bg-white px-4 py-3">
@@ -186,6 +302,14 @@ export default function MeetingDetailPage() {
         </div>
 
         <div className="px-4 py-5 space-y-5">
+          {/* 결제 상태 알림 */}
+          {paymentStatus && (
+            <div className="rounded-xl bg-blue-50 border border-blue-200 px-4 py-3 text-sm text-blue-700 flex items-center gap-2">
+              <span className="animate-spin">⏳</span>
+              {paymentStatus}
+            </div>
+          )}
+
           {/* 미팅 기본 정보 카드 */}
           <div className="rounded-2xl bg-white p-5 shadow-sm border border-gray-100">
             <div className="flex items-start justify-between">
@@ -242,9 +366,11 @@ export default function MeetingDetailPage() {
           <ActionArea
             meeting={meeting}
             actionLoading={actionLoading}
+            paymentLoading={paymentLoading}
             onJoin={handleJoin}
             onLeave={handleLeave}
             onConfirm={handleConfirm}
+            onPayment={handlePayment}
             onEnterChat={handleEnterChat}
           />
         </div>
@@ -260,18 +386,22 @@ export default function MeetingDetailPage() {
 interface ActionAreaProps {
   meeting: MeetingDetail;
   actionLoading: boolean;
+  paymentLoading: boolean;
   onJoin: () => void;
   onLeave: () => void;
   onConfirm: () => void;
+  onPayment: () => void;
   onEnterChat: () => void;
 }
 
 function ActionArea({
   meeting,
   actionLoading,
+  paymentLoading,
   onJoin,
   onLeave,
   onConfirm,
+  onPayment,
   onEnterChat,
 }: ActionAreaProps) {
   const { status, is_member, my_confirmed, chat_room_id, filled } = meeting;
@@ -294,7 +424,7 @@ function ActionArea({
     );
   }
 
-  // ── WAITING_CONFIRM: 확정하기 버튼
+  // ── WAITING_CONFIRM: 보증금 결제 + 확정 버튼
   if (status === "WAITING_CONFIRM" && is_member) {
     if (my_confirmed) {
       return (
@@ -303,29 +433,59 @@ function ActionArea({
           <p className="text-sm text-yellow-600">
             다른 멤버들의 확정을 기다리고 있습니다...
           </p>
-          {/* 폴링으로 자동 갱신되므로 별도 새로고침 버튼 불필요 */}
+          <p className="mt-2 text-xs text-gray-400">
+            (5초마다 자동으로 상태가 갱신됩니다)
+          </p>
         </div>
       );
     }
 
     return (
       <div className="space-y-3">
-        <div className="rounded-xl bg-yellow-50 border border-yellow-200 px-4 py-3 text-sm text-yellow-700">
-          ⚠️ 모든 슬롯이 채워졌습니다. 참가를 확정해주세요.
+        {/* 결제 안내 카드 */}
+        <div className="rounded-xl bg-yellow-50 border border-yellow-200 px-4 py-4 space-y-2">
+          <p className="text-sm font-semibold text-yellow-800">⚠️ 보증금 납부 후 참가 확정</p>
+          <p className="text-xs text-yellow-700 leading-relaxed">
+            노쇼 방지를 위해 <strong>보증금 10,000원</strong>을 납부해야 합니다.
+            미팅이 정상적으로 진행되면 전액 환불됩니다.
+          </p>
+          <div className="flex items-center justify-between pt-1">
+            <span className="text-xs text-yellow-600">납부 금액</span>
+            <span className="text-sm font-bold text-yellow-800">₩10,000</span>
+          </div>
         </div>
+
+        {/* Toss 결제 버튼 */}
         <button
-          onClick={onConfirm}
-          disabled={actionLoading}
-          className="w-full rounded-xl bg-yellow-400 py-3.5 text-sm font-bold text-white hover:bg-yellow-500 disabled:opacity-50 active:scale-95 transition-all"
+          onClick={onPayment}
+          disabled={paymentLoading || actionLoading}
+          className="w-full rounded-xl bg-blue-600 py-3.5 text-sm font-bold text-white hover:bg-blue-700 disabled:opacity-50 active:scale-95 transition-all flex items-center justify-center gap-2"
         >
-          {actionLoading ? "처리 중..." : "✅ 참가 확정하기"}
+          {paymentLoading ? (
+            <>
+              <span className="animate-spin">⏳</span>
+              결제 처리 중...
+            </>
+          ) : (
+            <>
+              💳 보증금 결제 후 참가 확정
+            </>
+          )}
         </button>
+
+        {/* 직접 확정 버튼 (Toss 키 없는 개발환경에서는 같은 효과) */}
+        {!process.env.NEXT_PUBLIC_TOSS_CLIENT_KEY && (
+          <p className="text-center text-xs text-gray-400">
+            개발 환경: 위 버튼이 mock 결제를 실행합니다
+          </p>
+        )}
+
         <button
           onClick={onLeave}
-          disabled={actionLoading}
+          disabled={actionLoading || paymentLoading}
           className="w-full rounded-xl border border-red-200 bg-white py-3 text-sm font-medium text-red-500 hover:bg-red-50 disabled:opacity-50 transition-all"
         >
-          나가기
+          나가기 (보증금 없이)
         </button>
       </div>
     );
